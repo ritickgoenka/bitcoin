@@ -75,6 +75,7 @@ class RPCPackagesTest(BitcoinTestFramework):
         self.test_chain()
         self.test_chain_limits()
         self.test_descendant_limits()
+        self.test_descendant_limits_bushy()
         self.test_ancestor_limits()
         self.test_ancestor_limits_bushy()
         self.test_multiple_children()
@@ -230,20 +231,18 @@ class RPCPackagesTest(BitcoinTestFramework):
         self.test_chain_limits_helper(13, 13)
 
     def test_descendant_limits(self):
-        """Create an 'A' shaped package with 24 transactions in the mempool and 2 in the package:
+        """Create an 'A' shaped package with 25 transactions in the mempool and 1 in the package:
                     M1
                    ^  ^
-                 M2a  M2b
-                .       .
-               .         .
-              .           .
-             M12a          ^
-            ^              M13b
-           ^                 ^
-          Pa                  Pb
-        The top ancestor in the package exceeds descendant limits but only if the in-mempool and in-package
-        descendants are all considered together (24 including in-mempool descendants and 26 including both
-        package transactions).
+                  ^   M2b
+                 ^       .
+                ^         .
+               ^           .
+              ^             ^
+             ^              M25b
+            ^                 
+          Pa                  
+        The top ancestor in the package exceeds descendant limits 
         """
         node = self.nodes[0]
         self.log.info("Check that in-mempool and in-package descendants are calculated properly in packages")
@@ -266,13 +265,10 @@ class RPCPackagesTest(BitcoinTestFramework):
         parent_locking_script = parent_tx.vout[0].scriptPubKey.hex()
         value = parent_value
         txid = parent_txid
-        for i in range(12):
+        for i in range(1):
             (tx, txhex, value, parent_locking_script) = self.chain_transaction(txid, value, 0, parent_locking_script)
             txid = tx.rehash()
-            if i < 11: # M2a... M12a
-                node.sendrawtransaction(txhex)
-            else: # Pa
-                package_hex.append(txhex)
+            package_hex.append(txhex)
 
         # Chain B
         value = parent_value - Decimal("0.0001")
@@ -284,25 +280,126 @@ class RPCPackagesTest(BitcoinTestFramework):
         node.sendrawtransaction(tx_child_b_hex)
         parent_locking_script = tx_child_b.vout[0].scriptPubKey.hex()
         txid = tx_child_b.rehash()
-        for i in range(12):
+        for i in range(23):
             (tx, txhex, value, parent_locking_script) = self.chain_transaction(txid, value, 0, parent_locking_script)
             txid = tx.rehash()
-            if i < 11: # M3b... M13b
-                node.sendrawtransaction(txhex)
-            else: # Pb
-                package_hex.append(txhex)
+            node.sendrawtransaction(txhex)
+
+        assert_equal(25, node.getmempoolinfo()["size"])
+        assert_equal(1, len(package_hex))
+        # testres_too_long = node.testmempoolaccept(rawtxs=package_hex)
+        # for txres in testres_too_long:
+        #     assert_equal(txres["reject-reason"], "exceeds-ancestor-descendant-limits")
+        #     assert_equal(txres["package-error"], "package-mempool-limits")
+
+        # # Clear mempool and check that the package passes now
+        # node.generate(1)
+        assert all([res["allowed"] for res in node.testmempoolaccept(rawtxs=package_hex)])
+        node.generate(1)
+
+    def test_descendant_limits_bushy(self):
+        """Create A bushy Package with 24 transaction in mempool and 3 transaction in package
+                              M1a                
+                             ^  ^                 
+                            ^    M2a              
+            M1b            ^       .               
+              ^           ^         .              
+               ^         ^           ^             
+                ^       ^            M23a 
+                 ^     ^ 
+                  ^   P1
+                   ^ ^  ^                  
+                    P2   P3                                               
+                                                                         
+        P1 has M1a as a mempool ancestor whereas P2 and P3 both have no in-mempool ancestors,
+        but when combined both P2 and P3 have M1a as an ancestor and M1a exceeds descendant_limits
+        (23 in mempool descendants + 3 in package descendants)
+        """
+        
+        node = self.nodes[0]
+        node.generate(1)
+        package_hex = []
+        parents_tx = []
+        values = []
+        parent_locking_scripts = []
+        # M1a
+        first_coin_a = self.coins.pop()
+        parent_value = (first_coin_a["amount"] - Decimal("0.0002")) / 2 # Deduct reasonable fee and make 2 outputs
+        inputs = [{"txid": first_coin_a["txid"], "vout": 0}]
+        outputs = [{self.address : parent_value}, {ADDRESS_BCRT1_P2WSH_OP_TRUE : parent_value}]
+        rawtx = node.createrawtransaction(inputs, outputs)
+
+        parent_signed = node.signrawtransactionwithkey(hexstring=rawtx, privkeys=self.privkeys)
+        assert parent_signed["complete"]
+        parent_tx = tx_from_hex(parent_signed["hex"])
+        parent_txid = parent_tx.rehash()
+        node.sendrawtransaction(parent_signed["hex"])
+        
+        # Chain M2a...M23a
+        value = parent_value - Decimal("0.0001")
+        rawtx_2a = node.createrawtransaction([{"txid": parent_txid, "vout": 1}], {self.address : value})
+        tx_child_2a = tx_from_hex(rawtx_2a) # M2a
+        tx_child_2a.wit.vtxinwit = [CTxInWitness()]
+        tx_child_2a.wit.vtxinwit[0].scriptWitness.stack = [CScript([OP_TRUE])]
+        tx_child_2a_hex = tx_child_2a.serialize().hex()
+        node.sendrawtransaction(tx_child_2a_hex)
+        parent_locking_script = tx_child_2a.vout[0].scriptPubKey.hex()
+        txid = tx_child_2a.rehash()
+        for i in range(21): # M3a... M23a
+            (tx, txhex, value, parent_locking_script) = self.chain_transaction(txid, value, 0, parent_locking_script)
+            txid = tx.rehash()
+            node.sendrawtransaction(txhex)
+
+        # P1
+        value_p1 = (parent_value - Decimal("0.0001")) / 2 # Deduct reasonable fee and make 2 outputs
+        inputs_p1 = [{"txid": parent_txid, "vout": 0}]
+        outputs_p1 = [{self.address : value_p1}, {ADDRESS_BCRT1_P2WSH_OP_TRUE : value_p1}]
+        rawtx_p1 = node.createrawtransaction(inputs_p1, outputs_p1)
+
+        parent_signed_p1 = node.signrawtransactionwithkey(hexstring=rawtx_p1, privkeys=self.privkeys)
+        assert parent_signed_p1["complete"]
+        parent_tx_p1 = tx_from_hex(parent_signed_p1["hex"])
+        parent_txid_p1 = parent_tx_p1.rehash()
+        package_hex.append(parent_signed_p1["hex"])
+        parents_tx.append(parent_tx_p1)
+        values.append(value_p1)
+        parent_locking_scripts.append(parent_tx_p1.vout[0].scriptPubKey.hex())
+
+        # P3
+        value_p3 = value_p1 - Decimal("0.0001")
+        rawtx_p3 = node.createrawtransaction([{"txid": parent_txid_p1, "vout": 1}], {self.address : value_p3})
+        tx_child_p3 = tx_from_hex(rawtx_p3)
+        tx_child_p3.wit.vtxinwit = [CTxInWitness()]
+        tx_child_p3.wit.vtxinwit[0].scriptWitness.stack = [CScript([OP_TRUE])]
+        tx_child_p3_hex = tx_child_p3.serialize().hex()
+        package_hex.append(tx_child_p3_hex)
+
+        # M1b
+        first_coin_b = self.coins.pop()
+        parent_locking_script = None
+        txid = first_coin_b["txid"]
+        value = first_coin_b["amount"]
+        (tx, txhex, value, parent_locking_script) = self.chain_transaction(txid, value, 0, parent_locking_script)
+        txid = tx.rehash()
+        node.sendrawtransaction(txhex)
+        parents_tx.append(tx)
+        values.append(value)
+        parent_locking_scripts.append(parent_locking_script)
+
+        # P2
+        child_hex = self.create_child_with_parents(parents_tx, values, parent_locking_scripts)
+        package_hex.append(child_hex)
 
         assert_equal(24, node.getmempoolinfo()["size"])
-        assert_equal(2, len(package_hex))
-        testres_too_long = node.testmempoolaccept(rawtxs=package_hex)
-        for txres in testres_too_long:
+        assert_equal(3, len(package_hex))
+        testres = node.testmempoolaccept(rawtxs=package_hex)
+        for txres in testres:
             assert_equal(txres["reject-reason"], "exceeds-ancestor-descendant-limits")
             assert_equal(txres["package-error"], "package-mempool-limits")
 
         # Clear mempool and check that the package passes now
         node.generate(1)
         assert all([res["allowed"] for res in node.testmempoolaccept(rawtxs=package_hex)])
-        node.generate(1)
 
     def test_ancestor_limits(self):
         """Create a 'V' shaped chain with 24 transactions in the mempool and 3 in the package:
